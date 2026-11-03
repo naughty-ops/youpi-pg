@@ -75,6 +75,31 @@ export function createPaymentApp(customDb = null, options = {}) {
 
   const eventEmitter = new EventEmitter();
 
+  // In-flight background task registry and shutdown lifecycle state
+  let isShuttingDown = false;
+  const inFlightTasks = new Set();
+
+  function trackTask(promise) {
+    if (!promise || typeof promise.then !== 'function') {
+      return promise;
+    }
+    const tracked = promise.then(
+      () => {},
+      () => {}
+    ).finally(() => {
+      inFlightTasks.delete(tracked);
+    });
+    inFlightTasks.add(tracked);
+    return promise;
+  }
+
+  async function drainTasks() {
+    while (inFlightTasks.size > 0) {
+      const currentTasks = Array.from(inFlightTasks);
+      await Promise.allSettled(currentTasks);
+    }
+  }
+
   // The active window and the processing window drive the slot expiry that is written to
   // the database, so a malformed value must not reach it: a negative value would expire
   // every session instantly and Infinity would throw a RangeError on toISOString().
@@ -116,7 +141,7 @@ export function createPaymentApp(customDb = null, options = {}) {
     eventEmitter
   });
 
-  const webhookEngine = new WebhookEngine({
+  const webhookEngine = options.webhookEngine || new WebhookEngine({
     db,
     merchantRepo,
     maxRetries: Number(process.env.WEBHOOK_MAX_RETRIES || 5)
@@ -156,6 +181,7 @@ export function createPaymentApp(customDb = null, options = {}) {
 
   // BULLETPROOF QUEUE PROMOTION HANDLER
   function handleSlotFreedAndPromote(receivingAccountId) {
+    if (isShuttingDown) return null;
     if (!receivingAccountId) return null;
     const promoted = queueEngine.promoteNext(receivingAccountId);
     if (promoted) {
@@ -175,6 +201,7 @@ export function createPaymentApp(customDb = null, options = {}) {
   }
 
   eventEmitter.on('PAYMENT.OBSERVED_SUCCESS', (data) => {
+    if (isShuttingDown) return;
     const session = sessionRepo.findById(data.paymentId);
     if (session) {
       server.broadcastSse(session.id, 'status_change', {
@@ -184,12 +211,13 @@ export function createPaymentApp(customDb = null, options = {}) {
         verificationTag: data.verificationTag || session.verificationTag,
         sources: data.sources || session.verificationSources
       });
-      webhookEngine.dispatch('OBSERVED_SUCCESS', session).catch(() => {});
+      trackTask(webhookEngine.dispatch('OBSERVED_SUCCESS', session).catch(() => {}));
       handleSlotFreedAndPromote(session.receivingAccountId);
     }
   });
 
   eventEmitter.on('PAYMENT.MANUAL_REVIEW', (data) => {
+    if (isShuttingDown) return;
     const session = sessionRepo.findById(data.paymentId);
     if (session) {
       server.broadcastSse(session.id, 'status_change', {
@@ -197,12 +225,13 @@ export function createPaymentApp(customDb = null, options = {}) {
         settlementState: 'MANUAL_REVIEW',
         reason: data.reason || null
       });
-      webhookEngine.dispatch('MANUAL_REVIEW', session).catch(() => {});
+      trackTask(webhookEngine.dispatch('MANUAL_REVIEW', session).catch(() => {}));
       handleSlotFreedAndPromote(session.receivingAccountId);
     }
   });
 
   eventEmitter.on('PAYMENT.RECONCILED', (data) => {
+    if (isShuttingDown) return;
     const session = sessionRepo.findById(data.paymentId);
     if (session && session.status === PaymentStatus.RECONCILED) {
       server.broadcastSse(session.id, 'status_change', {
@@ -210,12 +239,13 @@ export function createPaymentApp(customDb = null, options = {}) {
         settlementState: 'RECONCILED',
         statementLineId: data.statementLineId || null
       });
-      webhookEngine.dispatch('RECONCILED', session).catch(() => {});
+      trackTask(webhookEngine.dispatch('RECONCILED', session).catch(() => {}));
     }
   });
 
   // When a payment succeeds, fails, expires, or cancels: dispatch webhook & promote next queued customer
   eventEmitter.on('PAYMENT.SUCCESS', (data) => {
+    if (isShuttingDown) return;
     const session = sessionRepo.findById(data.paymentId);
     if (session) {
       server.broadcastSse(session.id, 'status_change', {
@@ -224,12 +254,13 @@ export function createPaymentApp(customDb = null, options = {}) {
         verificationTag: data.verificationTag || session.verificationTag,
         sources: data.sources || session.verificationSources
       });
-      webhookEngine.dispatch('SUCCESS', session).catch(() => {});
+      trackTask(webhookEngine.dispatch('SUCCESS', session).catch(() => {}));
       handleSlotFreedAndPromote(session.receivingAccountId);
     }
   });
 
   eventEmitter.on('PAYMENT.LEVEL1_VERIFIED', (data) => {
+    if (isShuttingDown) return;
     server.broadcastSse(data.paymentId, 'status_change', {
       status: 'VERIFYING',
       verificationLevel: 1,
@@ -239,36 +270,40 @@ export function createPaymentApp(customDb = null, options = {}) {
   });
 
   eventEmitter.on('PAYMENT.FAILED', (data) => {
+    if (isShuttingDown) return;
     const session = sessionRepo.findById(data.paymentId);
     if (session) {
-      webhookEngine.dispatch('FAILED', session).catch(() => {});
+      trackTask(webhookEngine.dispatch('FAILED', session).catch(() => {}));
       handleSlotFreedAndPromote(session.receivingAccountId);
     }
   });
 
   eventEmitter.on('PAYMENT.EXPIRED', (data) => {
+    if (isShuttingDown) return;
     const session = sessionRepo.findById(data.paymentId);
     if (session) {
       server.broadcastSse(session.id, 'status_change', {
         status: PaymentStatus.EXPIRED
       });
-      webhookEngine.dispatch('EXPIRED', session).catch(() => {});
+      trackTask(webhookEngine.dispatch('EXPIRED', session).catch(() => {}));
       handleSlotFreedAndPromote(session.receivingAccountId);
     }
   });
 
   eventEmitter.on('PAYMENT.CANCELLED', (data) => {
+    if (isShuttingDown) return;
     const session = sessionRepo.findById(data.paymentId);
     if (session) {
       server.broadcastSse(session.id, 'status_change', {
         status: PaymentStatus.CANCELLED
       });
-      webhookEngine.dispatch('CANCELLED', session).catch(() => {});
+      trackTask(webhookEngine.dispatch('CANCELLED', session).catch(() => {}));
       handleSlotFreedAndPromote(session.receivingAccountId);
     }
   });
 
   eventEmitter.on('PAYMENT.FRAUD_BLOCKED', (data) => {
+    if (isShuttingDown) return;
     if (data.sessionId) {
       server.broadcastSse(data.sessionId, 'status_change', {
         status: 'BLOCKED',
@@ -296,6 +331,7 @@ export function createPaymentApp(customDb = null, options = {}) {
 
   // Continuous 1-second background queue sync and auto-expiry daemon
   const queueSyncDaemon = setInterval(() => {
+    if (isShuttingDown) return;
     try {
       const nowIso = new Date().toISOString();
 
@@ -306,6 +342,7 @@ export function createPaymentApp(customDb = null, options = {}) {
       `, [nowIso]);
 
       for (const row of expiredActive) {
+        if (isShuttingDown) break;
         sessionRepo.transitionToTerminal(row.id, PaymentStatus.EXPIRED);
         server.broadcastSse(row.id, 'status_change', { status: PaymentStatus.EXPIRED });
         eventEmitter.emit('PAYMENT.EXPIRED', {
@@ -323,6 +360,7 @@ export function createPaymentApp(customDb = null, options = {}) {
       `, [nowIso]);
 
       for (const row of failedProc) {
+        if (isShuttingDown) break;
         sessionRepo.transitionToTerminal(row.id, PaymentStatus.FAILED);
         server.broadcastSse(row.id, 'status_change', { status: PaymentStatus.FAILED });
         eventEmitter.emit('PAYMENT.FAILED', {
@@ -340,6 +378,7 @@ export function createPaymentApp(customDb = null, options = {}) {
       `);
 
       for (const acc of vacantAccounts) {
+        if (isShuttingDown) break;
         handleSlotFreedAndPromote(acc.id);
       }
     } catch {}
@@ -347,24 +386,46 @@ export function createPaymentApp(customDb = null, options = {}) {
 
   if (queueSyncDaemon.unref) queueSyncDaemon.unref();
 
+  // Shared in-flight promise ensuring at most one webhook sweep executes at any given time
+  let activeWebhookSweepPromise = null;
+
+  function executeWebhookSweep() {
+    if (isShuttingDown) return null;
+    if (activeWebhookSweepPromise) {
+      return activeWebhookSweepPromise;
+    }
+
+    let sweepPromise;
+    sweepPromise = (async () => {
+      try {
+        await webhookEngine.recoverOutbox();
+        if (isShuttingDown) return;
+        await webhookEngine.retryPending();
+      } catch (err) {
+        // Silently absorb sweep errors to avoid unhandled rejection in background daemon
+      } finally {
+        if (activeWebhookSweepPromise === sweepPromise) {
+          activeWebhookSweepPromise = null;
+        }
+      }
+    })();
+
+    activeWebhookSweepPromise = sweepPromise;
+    trackTask(sweepPromise);
+    return sweepPromise;
+  }
+
   // Continuous Recurring Webhook Retry Daemon (Sweeps and dispatches pending webhook deliveries every 5s)
-  //
-  // The tick is defensive: `retryPending()` is expected to return a promise,
-  // but a throw inside it — or a non-promise return — must not escape the
-  // interval callback, because an exception thrown from a timer callback is
-  // an unhandled error that can take the process down.
   const webhookRetryDaemon = setInterval(() => {
-    try {
-      const outcome = webhookEngine.recoverOutbox().then(() => webhookEngine.retryPending());
-      if (outcome && typeof outcome.catch === 'function') outcome.catch(() => {});
-    } catch {}
+    if (isShuttingDown) return;
+    executeWebhookSweep().catch(() => {});
   }, Number(process.env.WEBHOOK_RETRY_INTERVAL_MS || 5000));
 
   if (webhookRetryDaemon.unref) webhookRetryDaemon.unref();
 
   // Consolidated, Coordinated Observer Polling & Verification Daemon
   // Eliminates duplicate HTTP sweeps, enforces 1.5s-2s cooldown, and prevents SQLite write contention
-  const observerPollerService = new ObserverPollerService({
+  const observerPollerService = options.observerPollerService || new ObserverPollerService({
     db,
     sessionRepo,
     obsRepo,
@@ -380,16 +441,16 @@ export function createPaymentApp(customDb = null, options = {}) {
 
   // Execute crash recovery on boot (AFTER event listeners are wired so recovered terminal transitions emit webhooks)
   const recoveryStats = recoveryEngine.recover();
-  // Replay only outboxed transitions that lack a durable delivery record.
-  webhookEngine.recoverOutbox().catch(err => {
-    console.error('[webhook] Failed to recover terminal-event outbox:', err.message);
-  });
 
-  // Immediately kick off a background retry sweep for any recovered in-flight or backfilled webhooks
-  try {
-    const initialRetry = webhookEngine.retryPending();
-    if (initialRetry && typeof initialRetry.catch === 'function') initialRetry.catch(() => {});
-  } catch {}
+  // Replay only outboxed transitions that lack a durable delivery record, then run initial retry sweep
+  const startupWebhookPromise = (async () => {
+    try {
+      await executeWebhookSweep();
+    } catch (err) {
+      console.error('[webhook] Failed to recover terminal-event outbox:', err?.message || err);
+    }
+  })();
+  trackTask(startupWebhookPromise);
 
   // Health check routes
   const healthHandler = (req, res) => {
@@ -445,33 +506,100 @@ export function createPaymentApp(customDb = null, options = {}) {
   registerPollerRoutes(server, context);
   registerAdminRoutes(server, context);
   registerStatementRoutes(server, context);
-  registerCustomerRoutes(server, context);
+  const cleanupCustomerRoutes = registerCustomerRoutes(server, context);
   registerDeviceRoutes(server, context);
 
+  let destroyPromise = null;
+
   function destroy() {
+    if (destroyPromise) return destroyPromise;
+
+    isShuttingDown = true;
+
+    // 1. Synchronously stop recurring timers and synchronous resources
     clearInterval(queueSyncDaemon);
     clearInterval(webhookRetryDaemon);
-    observerPollerService.destroy();
-    timingEngine.destroy();
+
+    if (typeof cleanupCustomerRoutes === 'function') {
+      try {
+        cleanupCustomerRoutes();
+      } catch (err) {
+        console.error('[shutdown] Error in customer route cleanup:', err);
+      }
+    }
+
+    try {
+      timingEngine.destroy();
+    } catch (err) {
+      console.error('[shutdown] Error destroying timing engine:', err);
+    }
+
     if (typeof attributionEngine.destroy === 'function') {
-      attributionEngine.destroy();
+      try {
+        attributionEngine.destroy();
+      } catch (err) {
+        console.error('[shutdown] Error destroying attribution engine:', err);
+      }
     }
-    if (whatsappBerryService && typeof whatsappBerryService.disconnect === 'function') {
-      whatsappBerryService.disconnect({ cleanSession: false }).catch(() => {});
-    }
+
+    // 2. Coordinate asynchronous cleanup
+    destroyPromise = (async () => {
+      // Drain in-flight HTTP requests and terminate SSE streams
+      if (server && typeof server.drainRequests === 'function') {
+        try {
+          await server.drainRequests();
+        } catch (err) {
+          console.error('[shutdown] Error draining HTTP server requests:', err);
+        }
+      }
+
+      // Await observer poller shutdown (waits for active pollCycle)
+      try {
+        if (observerPollerService && typeof observerPollerService.stopAsync === 'function') {
+          await observerPollerService.stopAsync();
+        } else if (observerPollerService && typeof observerPollerService.destroy === 'function') {
+          observerPollerService.destroy();
+        }
+      } catch (err) {
+        console.error('[shutdown] Error stopping observer poller service:', err);
+      }
+
+      // Await tracked background tasks (webhook recovery, retries, event dispatches)
+      try {
+        await drainTasks();
+      } catch (err) {
+        console.error('[shutdown] Error draining background tasks:', err);
+      }
+
+      // Await WhatsApp service disconnect if available
+      if (whatsappBerryService && typeof whatsappBerryService.disconnect === 'function') {
+        try {
+          await whatsappBerryService.disconnect({ cleanSession: false });
+        } catch (err) {
+          // Keep safe
+        }
+      }
+    })();
+
+    return destroyPromise;
   }
 
   return {
     server,
     context,
     destroy,
-    rawServer: server.createServer()
+    rawServer: server.createServer(),
+    isShuttingDown: () => isShuttingDown,
+    inFlightTasksCount: () => inFlightTasks.size,
+    trackTask,
+    drainTasks,
+    executeWebhookSweep
   };
 }
 
 export function startServer(port = null, customDb = null) {
   const finalPort = port ?? Number(
-  process.env.PORT || process.env.PAYMENT_API_PORT || 6100
+    process.env.PORT || process.env.PAYMENT_API_PORT || 6100
   );
   const app = createPaymentApp(customDb);
 
@@ -479,14 +607,92 @@ export function startServer(port = null, customDb = null) {
     // Loopback by default; reach this service via the local Cloudflare Tunnel, not 0.0.0.0.
     const bindHost = process.env.YOUPI_BIND_HOST || (process.env.RENDER ? '0.0.0.0' : '127.0.0.1');
     const instance = app.rawServer.listen(finalPort, bindHost, () => {
-      console.log(`[Payment API] Server listening on port ${finalPort}`);
+      const boundPort = instance.address()?.port || finalPort;
+      console.log(`[Payment API] Server listening on port ${boundPort}`);
+      let closePromise = null;
+      const close = (cb) => {
+        if (!closePromise) {
+          closePromise = (async () => {
+            // 1. Mark HttpServer as closing so any newly arriving requests receive 503
+            if (app.server) {
+              app.server.isClosing = true;
+            }
+
+            // 2. Stop Node HTTP server from accepting new TCP connections
+            let resolveServerClose;
+            let rejectServerClose;
+            const serverClosePromise = new Promise((resolve, reject) => {
+              resolveServerClose = resolve;
+              rejectServerClose = reject;
+            });
+            // Guard against unhandled rejections if an error occurs while subsequent steps execute
+            serverClosePromise.catch(() => {});
+
+            try {
+              instance.close((err) => {
+                if (err) {
+                  rejectServerClose(err);
+                } else {
+                  resolveServerClose();
+                }
+              });
+            } catch (err) {
+              rejectServerClose(err);
+            }
+
+            // 3. Drain active HTTP requests and gracefully close SSE connections
+            if (app.server && typeof app.server.drainRequests === 'function') {
+              try {
+                await app.server.drainRequests();
+              } catch (err) {
+                console.error('[shutdown] Error draining HTTP server requests:', err);
+              }
+            }
+
+            // 4. Close any remaining idle keep-alive connections
+            if (typeof instance.closeIdleConnections === 'function') {
+              try {
+                instance.closeIdleConnections();
+              } catch (err) {
+                console.error('[shutdown] Error closing idle connections:', err);
+              }
+            }
+
+            // 5. Await complete Node HTTP server closure
+            let closeError = null;
+            try {
+              await serverClosePromise;
+            } catch (err) {
+              if (err?.code !== 'ERR_SERVER_NOT_RUNNING') {
+                console.error('[shutdown] Error closing HTTP server instance:', err);
+                closeError = err;
+              }
+            }
+
+            // 6. Destroy app (stops timers, awaits observer poller, drains webhook tasks, disconnects WhatsApp)
+            try {
+              await app.destroy();
+            } catch (err) {
+              console.error('[shutdown] Error destroying app during close:', err);
+              if (!closeError) closeError = err;
+            }
+
+            if (closeError) {
+              throw closeError;
+            }
+          })();
+        }
+
+        if (typeof cb === 'function') {
+          closePromise.then(() => cb(null), (err) => cb(err));
+        }
+        return closePromise;
+      };
+
       resolve({
         app,
-        port: finalPort,
-        close: () => new Promise(cb => {
-          app.destroy();
-          instance.close(cb);
-        })
+        port: boundPort,
+        close
       });
     });
   });

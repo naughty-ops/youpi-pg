@@ -58,9 +58,11 @@ export class ObserverPollerService {
 
     // Lifecycle and concurrency control state
     this._isRunning = false;
+    this._isStopped = false;
     this._isPollingCycle = false;
     this._isIdle = true;
     this._timer = null;
+    this._activePollPromise = null;
 
     // Cooldown and in-flight tracking for observer endpoints
     this._lastSmsSweepTime = 0;
@@ -84,6 +86,10 @@ export class ObserverPollerService {
 
   get isRunning() {
     return this._isRunning;
+  }
+
+  get isPollingCycle() {
+    return this._isPollingCycle;
   }
 
   get isIdle() {
@@ -115,6 +121,7 @@ export class ObserverPollerService {
    */
   start() {
     if (this._isRunning) return;
+    this._isStopped = false;
     this._isRunning = true;
 
     // Bind reactive lifecycle events
@@ -143,6 +150,7 @@ export class ObserverPollerService {
    */
   stop() {
     this._isRunning = false;
+    this._isStopped = true;
 
     if (this._timer) {
       clearInterval(this._timer);
@@ -156,6 +164,29 @@ export class ObserverPollerService {
       this.eventEmitter.removeListener('PAYMENT.FAILED', this._boundOnPaymentTerminal);
       this.eventEmitter.removeListener('PAYMENT.EXPIRED', this._boundOnPaymentTerminal);
       this.eventEmitter.removeListener('PAYMENT.CANCELLED', this._boundOnPaymentTerminal);
+    }
+
+    if (!this._activePollPromise) {
+      this._inFlightObservationHashes.clear();
+      this._isPollingCycle = false;
+      this._isAttributionInProgress = false;
+      this._isSmsSweepInFlight = false;
+      this._isGmailSweepInFlight = false;
+      this._isIdle = true;
+    }
+  }
+
+  /**
+   * Asynchronously stops the daemon, clears timers, removes listeners,
+   * awaits the active polling cycle, and ensures all state is cleanly finalized.
+   */
+  async stopAsync() {
+    this.stop();
+
+    if (this._activePollPromise) {
+      try {
+        await this._activePollPromise;
+      } catch {}
     }
 
     this._inFlightObservationHashes.clear();
@@ -239,30 +270,41 @@ export class ObserverPollerService {
    * @param {string} [preferredAccountId]
    */
   async pollCycle(preferredAccountId = null) {
-    if (!this._isRunning || this._isPollingCycle) return;
+    if (this._isStopped || this._isPollingCycle) return;
     this._isPollingCycle = true;
 
-    try {
-      const activeSessions = this.getActiveSessions();
+    let cyclePromise;
+    cyclePromise = (async () => {
+      try {
+        const activeSessions = this.getActiveSessions();
 
-      if (activeSessions.length === 0) {
-        this._isIdle = true;
-        return;
+        if (activeSessions.length === 0 || this._isStopped) {
+          this._isIdle = true;
+          return;
+        }
+
+        this._isIdle = false;
+
+        // 1. Concurrently trigger external observer sweeps with strict cooldown & in-flight locks
+        await Promise.allSettled([
+          this.sweepSmsObserver(),
+          this.sweepGmailObserver()
+        ]);
+
+        if (this._isStopped) return;
+
+        // 2. Process pending unattributed bank observations in DB under sequential mutex lock
+        await this.processPendingAttributions(activeSessions, preferredAccountId);
+      } finally {
+        this._isPollingCycle = false;
+        if (this._activePollPromise === cyclePromise) {
+          this._activePollPromise = null;
+        }
       }
+    })();
 
-      this._isIdle = false;
-
-      // 1. Concurrently trigger external observer sweeps with strict cooldown & in-flight locks
-      await Promise.allSettled([
-        this.sweepSmsObserver(),
-        this.sweepGmailObserver()
-      ]);
-
-      // 2. Process pending unattributed bank observations in DB under sequential mutex lock
-      await this.processPendingAttributions(activeSessions, preferredAccountId);
-    } finally {
-      this._isPollingCycle = false;
-    }
+    this._activePollPromise = cyclePromise;
+    return cyclePromise;
   }
 
   /**
@@ -335,7 +377,7 @@ export class ObserverPollerService {
    * @param {string} [preferredAccountId]
    */
   async processPendingAttributions(activeSessions, preferredAccountId = null) {
-    if (this._isAttributionInProgress) return;
+    if (this._isStopped || this._isAttributionInProgress) return;
     this._isAttributionInProgress = true;
 
     try {
@@ -347,10 +389,12 @@ export class ObserverPollerService {
       }
 
       for (const accountId of accountIds) {
+        if (this._isStopped) break;
         const unattributed = this.obsRepo.findUnattributed(accountId);
         if (!Array.isArray(unattributed) || unattributed.length === 0) continue;
 
         for (const obs of unattributed) {
+          if (this._isStopped) break;
           const hash = obs.fingerprintHash || obs.id;
           if (this._inFlightObservationHashes.has(hash)) continue;
 

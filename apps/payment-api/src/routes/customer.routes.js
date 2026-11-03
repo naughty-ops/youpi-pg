@@ -643,4 +643,11 @@ export function registerCustomerRoutes(server, ctx) {
   server.get('/api/v1/customer/tickets/:id/stream', async (req, res) => {
     HttpServer.json(res, 404, { error: 'Feature not available' });
   });
+
+  return function cleanupCustomerRoutes() {
+    clearInterval(checkUserRateCleaner);
+    checkUserRateMap.clear();
+    pendingOtpChallenges.clear();
+    otpRequestLog.clear();
+  };
 }

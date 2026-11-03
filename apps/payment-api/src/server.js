@@ -43,6 +43,8 @@ export class HttpServer {
     this.routes = [];
     this.guards = [];
     this.sseClients = new Map(); // sessionId -> Set of res objects
+    this.activeRequests = new Set();
+    this.isClosing = false;
   }
 
   /**
@@ -152,6 +154,55 @@ export class HttpServer {
   }
 
   /**
+   * Gracefully terminates all active SSE subscriber connections.
+   */
+  closeSseConnections() {
+    for (const [topic, clients] of this.sseClients) {
+      for (const res of clients) {
+        try {
+          if (!res.writableEnded) {
+            res.write('event: shutdown\ndata: {"status":"shutdown"}\n\n');
+            res.end();
+          }
+        } catch {}
+      }
+    }
+    this.sseClients.clear();
+  }
+
+  /**
+   * Drains active in-flight HTTP requests and terminates SSE streams before shutdown.
+   * Primary invariant: drainRequests() must not resolve while any tracked request handler
+   * can still access SQLite. Even if the initial grace period expires, it continues awaiting
+   * all remaining handlers until they have completely settled.
+   * @param {number} [graceTimeoutMs=10000]
+   */
+  async drainRequests(graceTimeoutMs = 10000) {
+    this.isClosing = true;
+    this.closeSseConnections();
+    if (this.activeRequests.size === 0) return;
+
+    // Grace period: allow active requests to settle naturally up to graceTimeoutMs
+    if (graceTimeoutMs > 0 && this.activeRequests.size > 0) {
+      let timer;
+      const timeoutPromise = new Promise(resolve => {
+        timer = setTimeout(resolve, graceTimeoutMs);
+        if (timer.unref) timer.unref();
+      });
+      const allActive = Promise.allSettled(Array.from(this.activeRequests));
+      await Promise.race([allActive, timeoutPromise]);
+      clearTimeout(timer);
+    }
+
+    // PRIMARY INVARIANT: A timeout must NEVER be treated as proof that active requests have finished.
+    // Continue waiting until all tracked request handlers have completely settled before resolving.
+    while (this.activeRequests.size > 0) {
+      const remaining = Array.from(this.activeRequests);
+      await Promise.allSettled(remaining);
+    }
+  }
+
+  /**
    * Helper to send JSON responses with standard headers.
    */
   static json(res, statusCode, data) {
@@ -205,85 +256,110 @@ export class HttpServer {
    */
   createServer() {
     return http.createServer(async (req, res) => {
-      const origin = req.headers.origin;
-      const origins = configuredOrigins();
-      if (origin && !origins.has(origin)) {
-        HttpServer.json(res, 403, { error: 'Origin is not allowed.' });
+      if (this.isClosing) {
+        res.setHeader('Connection', 'close');
+        HttpServer.json(res, 503, { error: 'Server is shutting down' });
         return;
       }
-      if (origin) res.corsOrigin = origin;
-      // Handle CORS preflight
-      if (req.method === 'OPTIONS') {
-        if (!origin || !res.corsOrigin) {
+
+      let resolveDone;
+      const requestDone = new Promise(resolve => { resolveDone = resolve; });
+      this.activeRequests.add(requestDone);
+
+      try {
+        const origin = req.headers.origin;
+        const origins = configuredOrigins();
+        if (origin && !origins.has(origin)) {
           HttpServer.json(res, 403, { error: 'Origin is not allowed.' });
           return;
         }
-        res.writeHead(204, {
-          'Access-Control-Allow-Origin': res.corsOrigin,
-          'Vary': 'Origin',
-          'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-          'Access-Control-Allow-Headers': 'Content-Type, Authorization, Idempotency-Key, X-Device-Id, X-Device-Token, X-Device-Signature, X-Device-Payload, X-Customer-Token, X-Timestamp, X-Signature',
-          ...BASE_SECURITY_HEADERS
-        });
-        res.end();
-        return;
-      }
-
-      let parsedUrl;
-      try {
-        // Fixed base: the Host header is attacker-controlled and can make URL parsing throw.
-        parsedUrl = new URL(req.url, 'http://localhost');
-      } catch {
-        HttpServer.json(res, 400, { error: 'Malformed request URL' });
-        return;
-      }
-      const pathname = parsedUrl.pathname;
-      const method = req.method.toUpperCase();
-
-      if (isRateLimited(req, pathname)) {
-        res.setHeader('Retry-After', '60');
-        HttpServer.json(res, 429, { error: 'Too many requests. Please retry shortly.' });
-        return;
-      }
-
-      try {
-        for (const guard of this.guards) {
-          if (await guard(req, res, pathname, parsedUrl)) return;
-        }
-      } catch (err) {
-        console.error(`Guard Error [${method} ${pathname}]:`, err);
-        HttpServer.json(res, 500, { error: 'Internal Server Error' });
-        return;
-      }
-
-      for (const route of this.routes) {
-        if (route.method === method) {
-          const match = pathname.match(route.regex);
-          if (match) {
-            const params = {};
-            route.paramNames.forEach((name, index) => {
-              params[name] = match[index + 1];
-            });
-
-            req.query = Object.fromEntries(parsedUrl.searchParams.entries());
-
-            try {
-              await route.handler(req, res, params);
-            } catch (err) {
-              // Log the detail server-side; never echo stack/SQL text to an anonymous caller.
-              console.error(`Route Error [${method} ${pathname}]:`, {
-                name: err?.name || 'Error',
-                code: typeof err?.code === 'string' ? err.code : 'unclassified'
-              });
-              HttpServer.json(res, 500, { error: 'Internal Server Error' });
-            }
+        if (origin) res.corsOrigin = origin;
+        // Handle CORS preflight
+        if (req.method === 'OPTIONS') {
+          if (!origin || !res.corsOrigin) {
+            HttpServer.json(res, 403, { error: 'Origin is not allowed.' });
             return;
           }
+          res.writeHead(204, {
+            'Access-Control-Allow-Origin': res.corsOrigin,
+            'Vary': 'Origin',
+            'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+            'Access-Control-Allow-Headers': 'Content-Type, Authorization, Idempotency-Key, X-Device-Id, X-Device-Token, X-Device-Signature, X-Device-Payload, X-Customer-Token, X-Timestamp, X-Signature',
+            ...BASE_SECURITY_HEADERS
+          });
+          res.end();
+          return;
+        }
+
+        let parsedUrl;
+        try {
+          // Fixed base: the Host header is attacker-controlled and can make URL parsing throw.
+          parsedUrl = new URL(req.url, 'http://localhost');
+        } catch {
+          HttpServer.json(res, 400, { error: 'Malformed request URL' });
+          return;
+        }
+        const pathname = parsedUrl.pathname;
+        const method = req.method.toUpperCase();
+
+        if (isRateLimited(req, pathname)) {
+          res.setHeader('Retry-After', '60');
+          HttpServer.json(res, 429, { error: 'Too many requests. Please retry shortly.' });
+          return;
+        }
+
+        try {
+          for (const guard of this.guards) {
+            if (await guard(req, res, pathname, parsedUrl)) return;
+          }
+        } catch (err) {
+          console.error(`Guard Error [${method} ${pathname}]:`, err);
+          HttpServer.json(res, 500, { error: 'Internal Server Error' });
+          return;
+        }
+
+        for (const route of this.routes) {
+          if (route.method === method) {
+            const match = pathname.match(route.regex);
+            if (match) {
+              const params = {};
+              route.paramNames.forEach((name, index) => {
+                params[name] = match[index + 1];
+              });
+
+              req.query = Object.fromEntries(parsedUrl.searchParams.entries());
+
+              try {
+                await route.handler(req, res, params);
+              } catch (err) {
+                // Log the detail server-side; never echo stack/SQL text to an anonymous caller.
+                console.error(`Route Error [${method} ${pathname}]:`, {
+                  name: err?.name || 'Error',
+                  code: typeof err?.code === 'string' ? err.code : 'unclassified'
+                });
+                HttpServer.json(res, 500, { error: 'Internal Server Error' });
+              }
+              return;
+            }
+          }
+        }
+
+        // Not found
+        HttpServer.json(res, 404, { error: `Route not found: ${method} ${pathname}` });
+      } catch (fatalErr) {
+        console.error('Unhandled Server Error:', fatalErr);
+        try {
+          if (!res.headersSent) {
+            HttpServer.json(res, 500, { error: 'Internal Server Error' });
+          }
+        } catch {}
+      } finally {
+        this.activeRequests.delete(requestDone);
+        if (resolveDone) {
+          resolveDone();
+          resolveDone = null;
         }
       }
-
-      // Not found
-      HttpServer.json(res, 404, { error: `Route not found: ${method} ${pathname}` });
     });
   }
 }
